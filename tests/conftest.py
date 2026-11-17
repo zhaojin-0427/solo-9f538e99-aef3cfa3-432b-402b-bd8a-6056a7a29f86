@@ -22,7 +22,7 @@ def svc(tmp_db):
 
 @pytest.fixture()
 def client(tmp_db):
-    app = create_app(tmp_db)
+    app = create_app(tmp_db, synchronous=True)
     app.config["TESTING"] = True
     with app.test_client() as c:
         yield c, app.extensions["service"]

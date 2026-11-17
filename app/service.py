@@ -128,6 +128,13 @@ class Service:
         with self._lock:
             conn = get_db(self.db_path)
             try:
+                # 清单已停供或缺失的成功作业不再占用“活动作业”唯一位。
+                conn.execute(
+                    "UPDATE partition_jobs SET voided=1 WHERE version_id=? "
+                    "AND status='succeeded' AND (manifest_id IS NULL OR manifest_id IN "
+                    "(SELECT id FROM manifests WHERE quarantined=1))",
+                    (version["id"],),
+                )
                 cur = conn.execute(
                     "INSERT OR IGNORE INTO partition_jobs(version_id, status) "
                     "VALUES (?,'queued')",
@@ -139,11 +146,22 @@ class Service:
                 else:
                     row = conn.execute(
                         "SELECT id FROM partition_jobs WHERE version_id=? "
-                        "AND status IN ('queued','running','succeeded') ORDER BY id LIMIT 1",
+                        "AND status IN ('queued','running','succeeded') AND voided=0 "
+                        "ORDER BY id LIMIT 1",
                         (version["id"],),
                     ).fetchone()
-                    job_id = row["id"]
-                    is_new = False
+                    if row is None:
+                        # 极端并发下活动作业刚被作废：重试一次插入
+                        cur = conn.execute(
+                            "INSERT INTO partition_jobs(version_id, status) "
+                            "VALUES (?,'queued')",
+                            (version["id"],),
+                        )
+                        job_id = cur.lastrowid
+                        is_new = True
+                    else:
+                        job_id = row["id"]
+                        is_new = False
             finally:
                 conn.close()
 
@@ -204,9 +222,10 @@ class Service:
                 )
                 conn.execute("COMMIT")
                 return
-            # 并发保护：同版本已有成功清单则直接复用，不产生第二份
+            # 并发保护：同版本已有可下载的干净清单则直接复用，不产生第二份
             existing = conn.execute(
-                "SELECT id FROM manifests WHERE version_id=? AND status='published'",
+                "SELECT id FROM manifests WHERE version_id=? AND status='published' "
+                "AND quarantined=0",
                 (version["id"],),
             ).fetchone()
             if existing:
@@ -217,6 +236,12 @@ class Service:
                 )
                 conn.execute("COMMIT")
                 return
+            # 版本已就绪：任何“已成功但清单被停供作废”的同版本旧作业不再占用唯一位
+            conn.execute(
+                "UPDATE partition_jobs SET voided=1 WHERE version_id=? AND id<>? "
+                "AND status='succeeded'",
+                (version["id"], job_id),
+            )
 
             conn.execute(
                 "UPDATE partition_jobs SET status='running', "
@@ -256,13 +281,19 @@ class Service:
                 r["image_no"]: r["side"]
                 for r in conn.execute("SELECT image_no, side FROM side_registry").fetchall()
             }
+            conflicts = {
+                r["image_no"]: r["reason"]
+                for r in conn.execute(
+                    "SELECT image_no, reason FROM identity_conflicts"
+                ).fetchall()
+            }
         finally:
             conn.close()
         if self.solve_delay:
             import time
 
             time.sleep(self.solve_delay)
-        result = solve(components, classes, quota, registry)
+        result = solve(components, classes, quota, registry, conflicts)
         img_index = {r.image_no: r for r in images}
         entries = []
         for comp in components:
@@ -309,7 +340,8 @@ class Service:
                 conn.execute("COMMIT")
                 return
             dup = conn.execute(
-                "SELECT id FROM manifests WHERE version_id=? AND status='published'",
+                "SELECT id FROM manifests WHERE version_id=? AND status='published' "
+                "AND quarantined=0",
                 (version_id,),
             ).fetchone()
             if dup:
@@ -321,7 +353,7 @@ class Service:
                 conn.execute("COMMIT")
                 return
 
-            # 登记侧别前再次核对：永久登记与本次分配必须一致，冲突则整体失败
+            # 登记侧别前再次核对：永久登记、历史证据冲突与本次分配必须一致
             for e in data["entries"]:
                 row = conn.execute(
                     "SELECT side FROM side_registry WHERE image_no=?",
@@ -334,6 +366,22 @@ class Service:
                         (
                             f"关联冲突：图像 {e['image_no']} 曾发布且侧别永久固定为 "
                             f"{row['side']}，本次求解结果为 {e['side']}，已中止发布，未写入任何分配。",
+                            job_id,
+                        ),
+                    )
+                    conn.execute("COMMIT")
+                    return
+                conflict = conn.execute(
+                    "SELECT reason FROM identity_conflicts WHERE image_no=?",
+                    (e["image_no"],),
+                ).fetchone()
+                if conflict is not None:
+                    conn.execute(
+                        "UPDATE partition_jobs SET status='failed', fail_stage='conflict', "
+                        "finished_at=datetime('now'), reason=? WHERE id=?",
+                        (
+                            f"关联冲突：图像 {e['image_no']} 涉历史发布证据歧义。"
+                            f"{conflict['reason']} 已中止发布，未写入任何分配。",
                             job_id,
                         ),
                     )
@@ -404,10 +452,37 @@ class Service:
         version = self.current_version()
         if version is None:
             return None
+        # 只有当前版本、状态为 published 且未被历史身份隔离的清单才供数/下载
         conn = get_db(self.db_path)
         try:
             return conn.execute(
-                "SELECT * FROM manifests WHERE version_id=? AND status='published'",
+                "SELECT m.* FROM manifests m "
+                "WHERE m.version_id=? AND m.status='published' AND m.quarantined=0 "
+                "ORDER BY m.id DESC LIMIT 1",
+                (version["id"],),
+            ).fetchone()
+        finally:
+            conn.close()
+
+    def current_manifest_quarantine(self) -> sqlite3.Row | None:
+        """当前版本没有干净清单、只剩被隔离的旧清单时，返回停供原因供页面说明。"""
+        version = self.current_version()
+        if version is None:
+            return None
+        conn = get_db(self.db_path)
+        try:
+            if conn.execute(
+                "SELECT 1 FROM manifests WHERE version_id=? AND status='published' "
+                "AND quarantined=0 LIMIT 1",
+                (version["id"],),
+            ).fetchone():
+                return None
+            return conn.execute(
+                "SELECT m.id AS manifest_id, m.reason, q.reason AS quarantine_reason, "
+                "q.detail "
+                "FROM manifests m LEFT JOIN manifest_quarantine q ON q.manifest_id=m.id "
+                "WHERE m.version_id=? AND m.status='published' AND m.quarantined=1 "
+                "ORDER BY m.id DESC LIMIT 1",
                 (version["id"],),
             ).fetchone()
         finally:
@@ -426,14 +501,52 @@ class Service:
         finally:
             conn.close()
 
+    def get_manifest(self, manifest_id: int) -> sqlite3.Row | None:
+        conn = get_db(self.db_path)
+        try:
+            return conn.execute(
+                "SELECT m.*, v.status AS version_status, v.image_count, "
+                "q.reason AS quarantine_reason, q.detail AS quarantine_detail "
+                "FROM manifests m JOIN input_versions v ON v.id=m.version_id "
+                "LEFT JOIN manifest_quarantine q ON q.manifest_id=m.id WHERE m.id=?",
+                (manifest_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
     def list_manifests(self) -> list[sqlite3.Row]:
         conn = get_db(self.db_path)
         try:
             return list(
                 conn.execute(
-                    "SELECT m.*, v.status AS version_status, v.image_count "
+                    "SELECT m.*, v.status AS version_status, v.image_count, "
+                    "q.reason AS quarantine_reason, q.detail AS quarantine_detail "
                     "FROM manifests m JOIN input_versions v ON v.id=m.version_id "
+                    "LEFT JOIN manifest_quarantine q ON q.manifest_id=m.id "
                     "ORDER BY m.id DESC"
+                ).fetchall()
+            )
+        finally:
+            conn.close()
+
+    def list_identity_conflicts(self) -> list[sqlite3.Row]:
+        conn = get_db(self.db_path)
+        try:
+            return list(
+                conn.execute(
+                    "SELECT * FROM identity_conflicts ORDER BY image_no"
+                ).fetchall()
+            )
+        finally:
+            conn.close()
+
+    def list_legacy_identities(self) -> list[sqlite3.Row]:
+        conn = get_db(self.db_path)
+        try:
+            return list(
+                conn.execute(
+                    "SELECT * FROM legacy_identity_records "
+                    "ORDER BY manifest_id, entry_id"
                 ).fetchall()
             )
         finally:

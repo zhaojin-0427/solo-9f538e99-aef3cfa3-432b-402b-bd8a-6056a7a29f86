@@ -77,20 +77,35 @@ def _match_header(header: list[str], candidates: list[tuple[str, ...]]) -> list[
     return None
 
 
+def _detect_layout(
+    rows: list[list[str]], candidates: list[tuple[str, ...]], fallback: list[int]
+) -> tuple[list[int], int, bool]:
+    """识别表头列序。返回 (字段列下标, 数据起始行号, 是否识别到表头)。
+
+    关键：识别到表头后必须按识别出的列下标取字段，不能假设文件仍是固定列序。
+    """
+    col_idx = _match_header(rows[0], candidates)
+    if col_idx is not None:
+        return col_idx, 1, True
+    return fallback, 0, False
+
+
 def parse_images_csv(text: str) -> list[ImageRow]:
     rows = _read_rows(text)
-    col_idx = _match_header(rows[0], IMAGE_HEADERS)
-    if col_idx is not None:
-        data_rows = rows[1:]
-    else:
-        col_idx = [0, 1, 2]
-        data_rows = rows
+    col_idx, data_start, _has_header = _detect_layout(rows, IMAGE_HEADERS, [0, 1, 2])
+    data_rows = rows[data_start:]
+    img_idx, patient_idx, class_idx = col_idx
+    needed = max(col_idx) + 1
     out: list[ImageRow] = []
     seen: set[str] = set()
-    for n, row in enumerate(data_rows, start=2 if col_idx else 1):
-        if len(row) < 3:
-            raise InputError(f"图像 CSV 第 {n} 行列数不足，需要 3 列（图像号、患者号、类别）")
-        image_no, patient_no, class_name = row[0], row[1], row[2]
+    for n, row in enumerate(data_rows, start=data_start + 1):
+        if len(row) < needed:
+            raise InputError(
+                f"图像 CSV 第 {n} 行列数不足，按表头需要 {needed} 列（图像号、患者号、类别）"
+            )
+        image_no = row[img_idx]
+        patient_no = row[patient_idx]
+        class_name = row[class_idx]
         if not image_no or not patient_no or not class_name:
             raise InputError(f"图像 CSV 第 {n} 行存在空值（图像号、患者号、类别均必填）")
         if image_no in seen:
@@ -106,17 +121,17 @@ def parse_dups_csv(text: str) -> list[tuple[str, str]]:
     if text is None or not text.strip():
         return []
     rows = _read_rows(text)
-    col_idx = _match_header(rows[0], DUP_HEADERS)
-    if col_idx is not None:
-        data_rows = rows[1:]
-    else:
-        col_idx = [0, 1]
-        data_rows = rows
+    col_idx, data_start, _has_header = _detect_layout(rows, DUP_HEADERS, [0, 1])
+    data_rows = rows[data_start:]
+    a_idx, b_idx = col_idx
+    needed = max(col_idx) + 1
     edges: list[tuple[str, str]] = []
-    for n, row in enumerate(data_rows, start=2 if col_idx else 1):
-        if len(row) < 2:
-            raise InputError(f"重复关系 CSV 第 {n} 行列数不足，需要 2 列（图像号 A、图像号 B）")
-        a, b = row[0], row[1]
+    for n, row in enumerate(data_rows, start=data_start + 1):
+        if len(row) < needed:
+            raise InputError(
+                f"重复关系 CSV 第 {n} 行列数不足，按表头需要 {needed} 列（图像号 A、图像号 B）"
+            )
+        a, b = row[a_idx], row[b_idx]
         if not a or not b:
             raise InputError(f"重复关系 CSV 第 {n} 行存在空值")
         edges.append((a, b))

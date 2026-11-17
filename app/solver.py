@@ -1,6 +1,7 @@
 """划分求解器。
 
 分配单元是连通分量（同患者 + 重复关系），整个分量只能同去训练侧或验证侧。
+- 历史证据无法唯一确定侧别的图像，其分量一律判关联冲突（不任选一侧）；
 - 侧别登记表 (registry) 中已有记录的图像，其侧别永久固定，分量必须服从；
 - 未锁定的自由分量用多维 0/1 背包 DP 选择一个子集，使验证侧各类张数精确等于配额；
 - 无解时给出可解释的原因：关联冲突 / 配额不可达（含最接近状态与剩余分量）。
@@ -50,10 +51,36 @@ def solve(
     classes: list[str],
     quota: dict[str, int],
     registry: dict[str, str],
+    conflicts: dict[str, str] | None = None,
 ) -> SolveResult:
+    """求解划分。
+
+    conflicts：真实身份在历史证据中曾出现在两侧、或历史记录无法唯一对应的图像号
+    → 其涉及的连通分量一律判关联冲突，绝不任选一侧。
+    """
+    conflicts = conflicts or {}
     target = tuple(quota[c] for c in classes)
     ncls = len(classes)
     zero = tuple(0 for _ in classes)
+
+    # ---- 0. 历史证据冲突：涉及即拒绝，不进入任何一侧 --------------------
+    for comp in components:
+        hit = [img for img in comp.image_nos if img in conflicts]
+        if hit:
+            detail = {
+                "component_id": comp.cid,
+                "images": comp.image_nos,
+                "patients": sorted(comp.patients),
+                "conflict_images": hit,
+                "reasons": {img: conflicts[img] for img in hit},
+            }
+            raise SolveError(
+                "conflict",
+                f"关联冲突：连通分量 {comp.cid}（含图像 {', '.join(comp.image_nos)}）"
+                f"涉及历史发布证据无法唯一确定侧别的图像 {', '.join(hit)}，"
+                "按规则不得任选一侧。" + " ".join(conflicts[img] for img in hit),
+                detail,
+            )
 
     # ---- 1. 处理锁定分量，检测关联冲突 -------------------------------------
     locked_sum = [0] * ncls

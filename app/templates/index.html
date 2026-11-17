@@ -77,9 +77,31 @@
 {% else %}
 <div class="card">
   <h2>④ 当前下载状态</h2>
+  {% if quarantine %}
+  <p class="reason">当前版本只有一份受历史身份还原影响的旧清单 #{{ quarantine.manifest_id }}，已停供（原始明细与编号仍保留）。
+    原因：{{ quarantine.quarantine_reason or quarantine.reason }}<br>
+    证据与逐条还原见 <a href="{{ url_for('history') }}">历史与原因</a>。请按当前输入重新发起划分，成功后将生成新清单并恢复供数。</p>
+  {% else %}
   <p class="reason">当前版本尚无发布成功的清单（或上次划分失败/输入刚被更正），两侧下载均停供；重新划分成功后自动恢复。</p>
+  {% endif %}
 </div>
 {% endif %}
+{% endif %}
+
+{% if conflicts %}
+<div class="card">
+  <h2 style="color:#b91c1c">历史证据冲突（未决）</h2>
+  <p class="reason">以下真实图像的历史发布证据无法唯一确定侧别，未登记为任一侧；
+    涉及它们的连通分量在划分时会判关联冲突，不会任选一侧。证据可在
+    <a href="{{ url_for('history') }}">历史与原因</a> 查看。</p>
+  <table>
+    <tr><th>图像号</th><th>证据侧别</th><th>原因</th></tr>
+    {% for c in conflicts %}
+    <tr><td>{{ c.image_no }}</td><td class="muted">{{ c.sides }}</td>
+        <td class="muted">{{ c.reason }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
 {% endif %}
 
 <div class="card">

@@ -22,12 +22,19 @@ from .parser import InputError
 from .service import Service
 
 
-def create_app(db_path: str | None = None) -> Flask:
+def create_app(
+    db_path: str | None = None,
+    *,
+    synchronous: bool | None = None,
+    solve_delay: float | None = None,
+) -> Flask:
     app = Flask(__name__)
     app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
     db_path = db_path or os.environ.get("DB_PATH", "/data/pathology.db")
-    synchronous = os.environ.get("PYX_SYNCHRONOUS", "0") == "1"
-    solve_delay = float(os.environ.get("PYX_SOLVE_DELAY", "0"))
+    if synchronous is None:
+        synchronous = os.environ.get("PYX_SYNCHRONOUS", "0") == "1"
+    if solve_delay is None:
+        solve_delay = float(os.environ.get("PYX_SOLVE_DELAY", "0"))
     svc = Service(db_path, synchronous=synchronous, solve_delay=solve_delay)
     app.extensions["service"] = svc
 
@@ -36,7 +43,11 @@ def create_app(db_path: str | None = None) -> Flask:
     def index():
         version = svc.current_version()
         manifest = svc.current_manifest()
-        entries = svc.get_manifest_entries(manifest["id"]) if manifest else []
+        quarantine = svc.current_manifest_quarantine()
+        entries = (
+            svc.get_manifest_entries(manifest["id"])
+            if manifest else []
+        )
         jobs = svc.list_jobs(limit=8)
         classes = version["class_names"].split(",") if version else []
         quotas = json.loads(version["quotas"]) if version else {}
@@ -45,6 +56,8 @@ def create_app(db_path: str | None = None) -> Flask:
         for e in entries:
             bucket = val_counts if e["side"] == VALID else train_counts
             bucket[e["class_name"]] = bucket.get(e["class_name"], 0) + 1
+        # 当前版本存在未决的历史证据冲突时，页面明确提示（不影响其他清单供数）
+        conflicts = svc.list_identity_conflicts()
         return render_template(
             "index.html",
             version=version,
@@ -55,6 +68,8 @@ def create_app(db_path: str | None = None) -> Flask:
             quotas=quotas,
             val_counts=val_counts,
             train_counts=train_counts,
+            quarantine=quarantine,
+            conflicts=conflicts,
         )
 
     # ------------------------------------------------------------ 上传/更正
@@ -139,8 +154,15 @@ def create_app(db_path: str | None = None) -> Flask:
         versions = svc.list_versions()
         jobs = svc.list_jobs(limit=100)
         manifests = svc.list_manifests()
+        conflicts = svc.list_identity_conflicts()
+        legacy = svc.list_legacy_identities()
         return render_template(
-            "history.html", versions=versions, jobs=jobs, manifests=manifests
+            "history.html",
+            versions=versions,
+            jobs=jobs,
+            manifests=manifests,
+            conflicts=conflicts,
+            legacy=legacy,
         )
 
     @app.route("/versions/<int:version_id>")
@@ -158,7 +180,10 @@ def create_app(db_path: str | None = None) -> Flask:
                 "SELECT * FROM dup_edges WHERE version_id=? ORDER BY id", (version_id,)
             ).fetchall()
             manifest = conn.execute(
-                "SELECT * FROM manifests WHERE version_id=? AND status='published'",
+                "SELECT m.*, q.reason AS quarantine_reason "
+                "FROM manifests m LEFT JOIN manifest_quarantine q ON q.manifest_id=m.id "
+                "WHERE m.version_id=? AND m.status IN ('published','quarantined') "
+                "ORDER BY m.id DESC LIMIT 1",
                 (version_id,),
             ).fetchone()
         finally:
@@ -176,27 +201,27 @@ def create_app(db_path: str | None = None) -> Flask:
     @app.route("/registry")
     def registry():
         rows = svc.registry_snapshot()
-        return render_template("registry.html", rows=rows)
+        conflicts = svc.list_identity_conflicts()
+        return render_template("registry.html", rows=rows, conflicts=conflicts)
 
     # ------------------------------------------------------------ 下载
     @app.route("/manifests/<int:manifest_id>/download/<side>")
     def download(manifest_id: int, side):
         if side not in ("train", "val"):
             abort(404)
-        conn = get_db(svc.db_path)
-        try:
-            manifest = conn.execute(
-                "SELECT m.*, v.status AS version_status FROM manifests m "
-                "JOIN input_versions v ON v.id=m.version_id WHERE m.id=?",
-                (manifest_id,),
-            ).fetchone()
-        finally:
-            conn.close()
+        manifest = svc.get_manifest(manifest_id)
         if manifest is None or manifest["status"] != "published":
             abort(404)
-        # 更正后旧清单仅作历史：非当前版本一律停供下载
+        # 更正后旧清单仅作历史；历史身份受影响的清单停供，原因在历史页可查
         if manifest["version_status"] != "active":
             flash("该清单所属输入版本已被更正，仅作历史保留，当前下载停供。", "error")
+            return redirect(url_for("history"))
+        if manifest["quarantine_reason"]:
+            flash(
+                "该旧清单涉及历史身份还原问题，仅保留原始明细与编号，当前下载停供。"
+                + manifest["quarantine_reason"],
+                "error",
+            )
             return redirect(url_for("history"))
         entries = [e for e in svc.get_manifest_entries(manifest_id) if e["side"] == side]
         buf = io.StringIO()

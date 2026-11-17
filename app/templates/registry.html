@@ -18,4 +18,22 @@
     {% endfor %}
   </table>
 </div>
+
+{% if conflicts %}
+<div class="card">
+  <h2 style="color:#b91c1c">历史证据冲突（未登记为任一侧，涉及即拒绝划分）</h2>
+  <table>
+    <tr><th>真实图像号</th><th>证据侧别</th><th>原因</th><th>证据</th></tr>
+    {% for c in conflicts %}
+    <tr>
+      <td>{{ c.image_no }}</td>
+      <td class="muted">{{ c.sides }}</td>
+      <td class="muted" style="max-width:520px">{{ c.reason }}</td>
+      <td class="muted" style="max-width:300px">{{ c.evidence }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted">完整逐条还原证据见 <a href="{{ url_for('history') }}">历史与原因</a>。</p>
+</div>
+{% endif %}
 {% endblock %}

@@ -40,6 +40,49 @@
   </table>
 </div>
 
+{% if conflicts %}
+<div class="card">
+  <h2>历史身份关联冲突（证据保留，涉及即拒绝划分，不任选一侧）</h2>
+  <table>
+    <tr><th>真实图像号</th><th>历史证据侧别</th><th>原因</th><th>证据编号</th></tr>
+    {% for c in conflicts %}
+    <tr>
+      <td>{{ c.image_no }}</td>
+      <td class="muted">{{ c.sides }}</td>
+      <td class="muted" style="max-width:520px">{{ c.reason }}</td>
+      <td class="muted" style="max-width:260px">{{ c.evidence }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+{% if legacy %}
+<div class="card">
+  <h2>旧发布明细 → 真实身份还原证据（原清单与明细编号不变）</h2>
+  <table>
+    <tr><th>证据</th><th>清单</th><th>明细</th><th>旧登记键</th><th>旧患者号</th><th>类别</th>
+        <th>真实图像号</th><th>候选</th><th>判定</th><th>侧别</th></tr>
+    {% for r in legacy %}
+    <tr>
+      <td>#{{ r.id }}</td>
+      <td>#{{ r.manifest_id }}</td>
+      <td>#{{ r.entry_id }}</td>
+      <td>{{ r.legacy_image_no }}</td>
+      <td>{{ r.legacy_patient_no }}</td>
+      <td>{{ r.legacy_class_name }}</td>
+      <td>{{ r.resolved_image_no or '—' }}</td>
+      <td class="muted">{{ r.candidates }}</td>
+      <td>{% if r.resolution=='resolved' %}<span class="tag ok">唯一对应</span>
+          {% elif r.resolution=='ambiguous' %}<span class="tag fail">多候选-冲突</span>
+          {% else %}<span class="tag fail">无法对应-冲突</span>{% endif %}</td>
+      <td><span class="tag {{ r.side }}">{{ '验证' if r.side=='val' else '训练' }}</span></td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
 <div class="card">
   <h2>已发布清单</h2>
   <table>
@@ -48,10 +91,14 @@
     <tr>
       <td>#{{ m.id }}</td>
       <td>v{{ m.version_id }}</td>
-      <td>{% if m.version_status=='active' %}<span class="tag ok">当前</span>{% else %}<span class="tag hist">历史-停供</span>{% endif %}</td>
+      <td>{% if m.quarantined %}<span class="tag fail">历史-身份受影响-停供</span>
+          {% elif m.version_status=='active' %}<span class="tag ok">当前</span>
+          {% else %}<span class="tag hist">历史-停供</span>{% endif %}</td>
       <td>{{ m.created_at }}</td>
       <td>
-        {% if m.version_status=='active' %}
+        {% if m.quarantine_reason %}
+        <span class="muted">已停供，原因：{{ m.quarantine_reason }}</span>
+        {% elif m.status=='published' and m.version_status=='active' %}
         <a class="btn small" href="{{ url_for('download', manifest_id=m.id, side='val') }}">验证侧</a>
         <a class="btn small secondary" href="{{ url_for('download', manifest_id=m.id, side='train') }}">训练侧</a>
         {% else %}<span class="muted">已停供，仅可在版本详情中查看</span>{% endif %}

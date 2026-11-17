@@ -8,7 +8,10 @@
   <p class="muted">图像 {{ version.image_count }} 张 ｜ 类别 {{ version.class_names }} ｜ 配额 {{ version.quotas }} ｜ 创建 {{ version.created_at }}</p>
   {% if manifest %}
     <p>发布清单 #{{ manifest.id }}：
-      {% if version.status=='active' %}
+      {% if manifest.quarantine_reason %}
+        <span class="tag fail">历史身份受影响-停供</span>
+        <span class="muted">原因：{{ manifest.quarantine_reason }}</span>
+      {% elif version.status=='active' %}
       <a class="btn small" href="{{ url_for('download', manifest_id=manifest.id, side='val') }}">下载验证侧</a>
       <a class="btn small secondary" href="{{ url_for('download', manifest_id=manifest.id, side='train') }}">下载训练侧</a>
       {% else %}<span class="muted">历史版本，下载停供</span>{% endif %}
